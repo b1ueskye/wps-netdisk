@@ -16,7 +16,7 @@ _DEFAULTS = {
     "cookie": "",            # 浏览器抓的完整 Cookie (含 wps_sid/kso_sid/csrf)
     "group_id": 0,           # 云文档 group id
     "root_name": "WpsNetDisk",  # 云端根目录名(跨设备据此发现)
-    "chunk_size_mb": 512,    # 分片大小(MB), 单文件 kdocs 上限 2G
+    "chunk_size_mb": 128,    # 分片大小(MB), 单文件 kdocs 上限 2G
 }
 
 _lock = threading.Lock()

@@ -149,7 +149,8 @@ def upload_init(body: dict = Body(...)):
     svc = _svc()
     try:
         return svc.upload_init(int(body.get("parent_id", 0)),
-                               body.get("name", ""), int(body.get("size", 0)))
+                               body.get("name", ""), int(body.get("size", 0)),
+                               resume=bool(body.get("resume", True)))
     except ConflictError as e:
         raise HTTPException(409, str(e))
     except ServiceError as e:
@@ -180,6 +181,12 @@ def upload_complete(upload_id: str):
 @app.post("/api/upload/abort")
 def upload_abort(upload_id: str):
     return {"ok": _svc().upload_abort(upload_id)}
+
+
+@app.get("/api/uploads")
+def list_uploads():
+    svc = STATE["service"]
+    return {"uploads": svc.list_uploads() if svc else []}
 
 
 @app.get("/api/download/{node_id}")

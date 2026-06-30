@@ -142,8 +142,28 @@ function App(){
   const [pid,setPid]=useState(0);
   const [err,setErr]=useState('');
   const [dragging,setDragging]=useState(false);
-  const [uploads,setUploads]=useState([]);
+  const [uploads,setUploads]=useState(()=>{
+    // 刷新后从 localStorage 恢复上传记录; 仍标记为上传中的, 因页面已刷新实际已中断
+    try{
+      const saved=JSON.parse(localStorage.getItem('netdisk_uploads')||'[]');
+      return saved.map(u=>u.state==='uploading'
+        ?{...u,state:'interrupted',msg:'刷新后已中断, 请重新上传'}:u);
+    }catch(_){ return []; }
+  });
   const fileInput=useRef();
+
+  // 上传记录持久化到 localStorage(剔除无法序列化的 File 引用), 刷新不丢
+  useEffect(()=>{
+    try{ localStorage.setItem('netdisk_uploads',
+      JSON.stringify(uploads.map(({file,...r})=>r))); }catch(_){}
+  },[uploads]);
+  const dismissUpload=(id)=>setUploads(u=>u.filter(x=>x.id!==id));
+  // 继续上传: 同会话内文件还在内存 -> 直接续传不弹框; 刷新后文件已丢 -> 需重选
+  const continueUpload=(u)=>{
+    if(u.file){ setUploads(s=>s.map(x=>x.id===u.id?{...x,state:'uploading',pct:0,msg:''}:x));
+      uploadOne(u.file,u.id); }
+    else { fileInput.current&&fileInput.current.click(); }
+  };
 
   const refreshStatus=useCallback(async()=>{ const s=await api.status(); setStatus(s); return s; },[]);
   const load=useCallback(async(p)=>{ setErr('');
@@ -180,22 +200,39 @@ function App(){
       const r=await fetch('/api/upload/init',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({parent_id:pid,name:file.name,size:file.size})});
       if(!r.ok) throw new Error((await r.json()).detail||'init 失败');
-      const {upload_id,num_chunks,chunk_size}=await r.json();
+      const {upload_id,num_chunks,chunk_size,done_idx}=await r.json();
       const total=file.size||1;
-      const CONC=Math.min(3,num_chunks);     // 并发连接数, 3 即可吃满上行带宽
+      const CONC=Math.min(5,num_chunks);     // 并发连接数; 实测 5 路稳定吃满上行带宽, 再多会写超时/失败
       const loaded=new Array(num_chunks).fill(0);
-      let done=0;
+      const doneSet=new Set(done_idx||[]);   // 续传: 云端已存在的分片直接跳过
+      let done=doneSet.size;
+      for(const i of doneSet){ const e=Math.min((i+1)*chunk_size,file.size); loaded[i]=e-i*chunk_size; }
       const refresh=()=>{
         const sum=loaded.reduce((a,b)=>a+b,0);
         upd({pct:Math.min(99,Math.round(sum/total*100)), state:'uploading',
-             msg:num_chunks>1?`${done}/${num_chunks}片 · ${CONC}并发`:''});
+             msg:num_chunks>1?`${done}/${num_chunks}片 · ${CONC}并发${doneSet.size?' · 续传':''}`:''});
       };
+      refresh();
       let next=0;
       const worker=async()=>{
         while(true){
           const idx=next++; if(idx>=num_chunks) break;
+          if(doneSet.has(idx)) continue;     // 已传过, 跳过
           const start=idx*chunk_size, end=Math.min(start+chunk_size,file.size);
-          await sendPart(upload_id,idx,file.slice(start,end),(b)=>{ loaded[idx]=b; refresh(); });
+          // 单分片失败自动重试(最多4次, 退避), 不再一失败就整体中断
+          let lastErr;
+          let okPart=false;
+          for(let attempt=1; attempt<=4; attempt++){
+            try{
+              await sendPart(upload_id,idx,file.slice(start,end),(b)=>{ loaded[idx]=b; refresh(); });
+              okPart=true; break;
+            }catch(e){
+              lastErr=e; loaded[idx]=0;
+              upd({state:'uploading',msg:`第${idx+1}片重试 ${attempt}/4...`});
+              await new Promise(r=>setTimeout(r,Math.min(2000*attempt,8000)));
+            }
+          }
+          if(!okPart) throw lastErr||new Error('分片上传失败');
           loaded[idx]=end-start; done++; refresh();
         }
       };
@@ -206,15 +243,15 @@ function App(){
       load(pid);
       setTimeout(()=>setUploads(u=>u.filter(x=>x.id!==uiId)),2500);
     }catch(e){
+      // 失败记录保留, 由用户手动关闭, 不再自动消失
       upd({state:'error',msg:String(e.message||e)});
-      setTimeout(()=>setUploads(u=>u.filter(x=>x.id!==uiId)),6000);
     }
   },[pid,load]);
 
   const uploadFiles=useCallback((files)=>{
     [...files].forEach(file=>{
       const uiId=Math.random().toString(36).slice(2);
-      setUploads(u=>[...u,{id:uiId,name:file.name,pct:0,state:'uploading'}]);
+      setUploads(u=>[...u,{id:uiId,name:file.name,pct:0,state:'uploading',file}]);
       uploadOne(file,uiId);
     });
   },[uploadOne]);
@@ -263,9 +300,36 @@ function App(){
       </div>
       <div className="main">
         {err && <div className="err">{err}</div>}
-        {nodes.length===0 ? <div className="empty">这个文件夹是空的 —— 拖拽文件到此处即可上传</div> :
+        {(nodes.length===0 && uploads.length===0) ? <div className="empty">这个文件夹是空的 —— 拖拽文件到此处即可上传</div> :
         <table><thead><tr><th>名称</th><th style={{width:130}}>大小</th><th style={{width:180}}>修改时间</th><th style={{width:160}}></th></tr></thead>
-        <tbody>{nodes.map(n=>
+        <tbody>
+          {uploads.map(u=>{
+            const bad=u.state==='error'||u.state==='interrupted';
+            const label=u.state==='done'?'✓ 完成'
+              :u.state==='error'?'✗ 失败'
+              :u.state==='interrupted'?'⚠ 已中断'
+              :'上传中 '+(u.msg?u.msg+' ':'')+u.pct+'%';
+            return <tr className="row" key={'up_'+u.id} style={{background:'rgba(76,141,255,.06)'}}>
+              <td><div className="name" style={{alignItems:'flex-start'}}>
+                <span className="ic">⏫</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+                    <span title={u.name}>{u.name}</span>
+                    <span className="badge" style={{color:bad?'var(--danger)':u.state==='done'?'var(--ok)':'var(--accent)'}}>{label}</span>
+                  </div>
+                  <div className="bar" style={{marginTop:6}}><i style={{width:u.pct+'%',background:bad?'var(--danger)':u.state==='done'?'var(--ok)':'var(--accent)'}}/></div>
+                  {bad && u.msg && <div style={{fontSize:11,color:'var(--muted)',marginTop:4}}>{u.msg}</div>}
+                </div>
+              </div></td>
+              <td className="muted">-</td>
+              <td className="muted">-</td>
+              <td><div className="acts">
+                {bad && <span className="iconbtn" onClick={()=>continueUpload(u)}>{u.file?'继续上传':'继续上传(需重选文件)'}</span>}
+                {(bad||u.state==='done') && <span className="iconbtn del" onClick={()=>dismissUpload(u.id)}>关闭</span>}
+              </div></td>
+            </tr>;
+          })}
+          {nodes.map(n=>
           <tr className="row" key={n.id}>
             <td><div className="name" onClick={()=>n.type==='dir'?load(n.id):doDownload(n)}>
               <span className="ic">{n.type==='dir'?'📁':'📄'}</span><span>{n.name}</span></div></td>
@@ -280,13 +344,6 @@ function App(){
         </tbody></table>}
       </div>
     </>}
-
-    {uploads.length>0 && <div className="uploads">{uploads.map(u=>
-      <div className="up" key={u.id}>
-        <div className="t"><span>{u.name}</span>
-          <span className="badge">{u.state==='done'?'✓ 完成':u.state==='error'?'✗ '+(u.msg||'失败'):u.pct+'%'}</span></div>
-        <div className="bar"><i style={{width:u.pct+'%',background:u.state==='error'?'var(--danger)':u.state==='done'?'var(--ok)':'var(--accent)'}}/></div>
-      </div>)}</div>}
 
     {showCfg && <ConfigModal status={status} onClose={()=>setShowCfg(false)} onSaved={onSaved}/>}
   </div>;

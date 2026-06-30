@@ -9,12 +9,23 @@
 """
 import hashlib
 import json
+import time
 import urllib.parse
 
 import requests
+from requests.adapters import HTTPAdapter
+
+from .applog import logger
 
 DRIVE = "https://drive.kdocs.cn"
 WWW = "https://www.kdocs.cn"
+
+# (连接超时, 读超时) 秒。读超时是"两次收到数据之间"的最大间隔, 不是总时长,
+# 因此慢但持续传输的大分片不会被误杀; 但真正挂死的连接会被打断以便重试。
+CONNECT_TIMEOUT = 30
+READ_TIMEOUT = 120
+API_TIMEOUT = (CONNECT_TIMEOUT, 60)
+PUT_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -40,6 +51,10 @@ class KdocsClient:
         self.group_id = int(group_id)
         self.csrf = csrf
         self.sess = requests.Session()
+        # 调大连接池, 稳定支撑多路并发分片上传(重试由 upload_blob 自行处理, 这里关掉)
+        _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+        self.sess.mount("https://", _adapter)
+        self.sess.mount("http://", _adapter)
         self.sess.headers.update({
             "user-agent": _UA,
             "origin": WWW,
@@ -52,7 +67,7 @@ class KdocsClient:
     # ---------- 自动发现私有空间 group ----------
     def discover_group_id(self) -> int:
         """用 Cookie 取「我的云文档」私有空间 group id, 无需用户手填。"""
-        r = self.sess.get(f"{DRIVE}/api/v3/groups/special")
+        r = self.sess.get(f"{DRIVE}/api/v3/groups/special", timeout=API_TIMEOUT)
         r.raise_for_status()
         gid = int(r.json()["id"])
         self.group_id = gid
@@ -66,6 +81,7 @@ class KdocsClient:
                 f"{DRIVE}/api/v5/groups/{self.group_id}/files",
                 params={"parentid": parent_id, "offset": offset, "count": count,
                         "orderby": "fname", "order": "asc"},
+                timeout=API_TIMEOUT,
             )
             r.raise_for_status()
             d = r.json()
@@ -86,7 +102,7 @@ class KdocsClient:
     def mkdir(self, parent_id: int, name: str) -> dict:
         body = {"groupid": self.group_id, "parentid": int(parent_id), "name": name,
                 "parsed": True, "owner": True, "csrfmiddlewaretoken": self.csrf}
-        r = self.sess.post(f"{DRIVE}/api/v5/files/folder",
+        r = self.sess.post(f"{DRIVE}/api/v5/files/folder", timeout=API_TIMEOUT,
                            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                            headers={"content-type": "application/json"})
         r.raise_for_status()
@@ -100,7 +116,8 @@ class KdocsClient:
 
     # ---------- 删除 ----------
     def delete(self, file_id: int) -> bool:
-        r = self.sess.delete(f"{DRIVE}/api/v3/groups/{self.group_id}/files/{file_id}")
+        r = self.sess.delete(f"{DRIVE}/api/v3/groups/{self.group_id}/files/{file_id}",
+                             timeout=API_TIMEOUT)
         # 已不存在也视作成功
         if r.status_code in (200, 403, 404):
             return True
@@ -120,7 +137,8 @@ class KdocsClient:
         }
         r = self.sess.put(f"{DRIVE}/api/v5/files/upload/create_update",
                           data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                          headers={"content-type": "application/json"})
+                          headers={"content-type": "application/json"},
+                          timeout=API_TIMEOUT)
         r.raise_for_status()
         return r.json()
 
@@ -140,7 +158,7 @@ class KdocsClient:
 
     def _put_store(self, plan, data):
         headers = dict(plan["request"]["headers"])
-        r = self.sess.put(plan["url"], data=data, headers=headers)
+        r = self.sess.put(plan["url"], data=data, headers=headers, timeout=PUT_TIMEOUT)
         r.raise_for_status()
         spec = plan.get("response", {})
         key = self._extract(spec.get("args_key"), r)
@@ -158,7 +176,8 @@ class KdocsClient:
             body["file_id"] = int(file_id)
         r = self.sess.post(f"{DRIVE}/api/v5/files/file",
                            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                           headers={"content-type": "application/json"})
+                           headers={"content-type": "application/json"},
+                           timeout=API_TIMEOUT)
         r.raise_for_status()
         return r.json()
 
@@ -170,16 +189,30 @@ class KdocsClient:
         """
         md5 = md5_hex(data)
         sha1 = sha1_hex(data)
-        plan = self._create_update(parent_id, name, len(data), md5, file_id=file_id)
-        store = plan.get("store", "ks3")
-        key, _etag = self._put_store(plan, data)
-        if not key:
-            key = sha1  # saveKey=${SHA1}
-        res = self._commit(parent_id, name, key, md5, sha1, len(data), store,
-                           file_id=file_id, up_new_ver=up_new_ver)
-        if res.get("result") != "ok":
-            raise KdocsError(f"commit 失败: {res}")
-        return res
+        attempts = 4
+        for attempt in range(1, attempts + 1):
+            try:
+                t0 = time.time()
+                plan = self._create_update(parent_id, name, len(data), md5, file_id=file_id)
+                store = plan.get("store", "ks3")
+                key, _etag = self._put_store(plan, data)
+                if not key:
+                    key = sha1  # saveKey=${SHA1}
+                res = self._commit(parent_id, name, key, md5, sha1, len(data), store,
+                                   file_id=file_id, up_new_ver=up_new_ver)
+                if res.get("result") != "ok":
+                    raise KdocsError(f"commit 失败: {res}")
+                dt = time.time() - t0
+                mb = len(data) / 1024 / 1024
+                logger.info("upload_blob OK name=%s size=%.1fMB %.1fs (%.2fMB/s) store=%s try=%d",
+                            name, mb, dt, mb / dt if dt else 0, store, attempt)
+                return res
+            except Exception as e:  # noqa
+                logger.warning("upload_blob FAIL name=%s try=%d/%d: %s",
+                               name, attempt, attempts, e)
+                if attempt >= attempts:
+                    raise
+                time.sleep(min(2 ** attempt, 15))  # 退避重试: 2s,4s,8s
 
     # ---------- 下载 ----------
     def download_url(self, file_id: int) -> str:
@@ -188,7 +221,8 @@ class KdocsClient:
         用 /api/v3/groups/{gid}/files/{id}/download (任意文件均可),
         而非 /office/file/{id}/download(仅支持可预览的 office 类型)。
         """
-        r = self.sess.get(f"{DRIVE}/api/v3/groups/{self.group_id}/files/{file_id}/download")
+        r = self.sess.get(f"{DRIVE}/api/v3/groups/{self.group_id}/files/{file_id}/download",
+                          timeout=API_TIMEOUT)
         r.raise_for_status()
         info = r.json()
         fi = info.get("fileinfo") or {}
@@ -199,14 +233,14 @@ class KdocsClient:
 
     def download_blob(self, file_id: int) -> bytes:
         url = self.download_url(file_id)
-        r = requests.get(url, headers={"user-agent": _UA})
+        r = requests.get(url, headers={"user-agent": _UA}, timeout=PUT_TIMEOUT)
         r.raise_for_status()
         return r.content
 
     def rename(self, file_id: int, new_name: str) -> dict:
         """重命名文件/文件夹: PUT /api/v3/groups/{gid}/files/{id} {fname}。"""
         body = {"fname": new_name, "csrfmiddlewaretoken": self.csrf}
-        r = self.sess.put(f"{DRIVE}/api/v3/groups/{self.group_id}/files/{file_id}",
+        r = self.sess.put(f"{DRIVE}/api/v3/groups/{self.group_id}/files/{file_id}", timeout=API_TIMEOUT,
                           data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                           headers={"content-type": "application/json"})
         r.raise_for_status()
