@@ -23,7 +23,8 @@ WWW = "https://www.kdocs.cn"
 # (连接超时, 读超时) 秒。读超时是"两次收到数据之间"的最大间隔, 不是总时长,
 # 因此慢但持续传输的大分片不会被误杀; 但真正挂死的连接会被打断以便重试。
 CONNECT_TIMEOUT = 30
-READ_TIMEOUT = 120
+# 健康连接会持续有字节流动, 不会触发该超时; 仅当连接被饿死(零字节)时才触发, 故设短一些以便快速重试
+READ_TIMEOUT = 60
 API_TIMEOUT = (CONNECT_TIMEOUT, 60)
 PUT_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
@@ -230,6 +231,27 @@ class KdocsClient:
         if not url:
             raise KdocsError(f"未取得下载直链: {info}")
         return url
+
+    def iter_download_blob(self, file_id: int, chunk_size: int = 1 << 20, start_offset: int = 0):
+        """流式下载分片, 逐块 yield bytes, 避免整片读入内存。
+
+        用于 HTTP 流式转发: 数据一到就下发给客户端, 浏览器立即开始下载进度。
+        start_offset 用于下载中断后从断点续传重试(KS3 预签名直链支持 Range)。
+        """
+        url = self.download_url(file_id)
+        t0 = time.time()
+        headers = {}
+        if start_offset > 0:
+            headers["Range"] = f"bytes={start_offset}-"
+        with self.sess.get(url, timeout=PUT_TIMEOUT, stream=True, headers=headers) as r:
+            r.raise_for_status()
+            total = start_offset
+            for block in r.iter_content(chunk_size):
+                if block:
+                    total += len(block)
+                    yield block
+            logger.info("DOWNLOAD blob fileid=%s %.1fMB %.1fs offset=%d",
+                        file_id, total / 1024 / 1024, time.time() - t0, start_offset)
 
     def download_blob(self, file_id: int) -> bytes:
         url = self.download_url(file_id)

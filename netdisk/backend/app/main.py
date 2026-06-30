@@ -5,8 +5,10 @@ import urllib.parse
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Request
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.requests import ClientDisconnect
 
 from . import config as cfgmod
+from .applog import logger
 from .kdocs import KdocsClient
 from .sync import NetDiskSync, ConflictError
 from .service import NetDiskService, ServiceError
@@ -160,7 +162,12 @@ def upload_init(body: dict = Body(...)):
 @app.post("/api/upload/part")
 async def upload_part(upload_id: str, idx: int, request: Request):
     svc = _svc()
-    data = await request.body()
+    try:
+        data = await request.body()
+    except ClientDisconnect:
+        # 浏览器刷新/取消会中断在传请求, 这是预期的, 不必当作错误刷屏
+        logger.info("UPLOAD part 客户端断开 id=%s idx=%s (刷新或取消)", upload_id[:8], idx)
+        return JSONResponse({"ok": False, "disconnected": True}, status_code=499)
     try:
         return svc.upload_part(upload_id, idx, data)
     except ServiceError as e:

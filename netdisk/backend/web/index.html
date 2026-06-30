@@ -202,7 +202,7 @@ function App(){
       if(!r.ok) throw new Error((await r.json()).detail||'init 失败');
       const {upload_id,num_chunks,chunk_size,done_idx}=await r.json();
       const total=file.size||1;
-      const CONC=Math.min(5,num_chunks);     // 并发连接数; 实测 5 路稳定吃满上行带宽, 再多会写超时/失败
+      const CONC=Math.min(2,num_chunks);     // 上行带宽受限: 单条≈吃满带宽, 并发>2 会让部分连接被饿死→写超时, 反而更慢
       const loaded=new Array(num_chunks).fill(0);
       const doneSet=new Set(done_idx||[]);   // 续传: 云端已存在的分片直接跳过
       let done=doneSet.size;

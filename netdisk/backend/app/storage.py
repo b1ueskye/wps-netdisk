@@ -3,9 +3,19 @@
 云文档单文件上限 2G, 所以默认分片 512MB。每个分片是云端一个独立文件(fileid)。
 """
 import hashlib
+import time
+import queue
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
+from .applog import logger
 from .kdocs import KdocsClient, md5_hex, sha1_hex
+
+# 并发下载分片数。与上传保持同一量级(5 路), 再多受云端限速/连接数制约收益递减。
+DOWNLOAD_CONCURRENCY = 3
+# 每个分片在内存中预取的块数(背压), 防止某个分片跑太快把内存撑爆。
+DOWNLOAD_QUEUE_SIZE = 8
 
 
 def upload_stream(kdocs: KdocsClient, folder_id: int, fileobj, chunk_size: int):
@@ -92,10 +102,72 @@ def mirror_upload(kdocs: KdocsClient, real_parent_id: int, name: str, fileobj, c
     return chunks, total, hasher.hexdigest(), sub_id
 
 
-def iter_download(kdocs: KdocsClient, chunks: list):
-    """按 idx 顺序下载每个分片并 yield 字节流, 供流式下载使用。"""
-    for c in sorted(chunks, key=lambda x: x["idx"]):
-        yield kdocs.download_blob(int(c["kdocs_fileid"]))
+def iter_download(kdocs: KdocsClient, chunks: list, concurrency: int = DOWNLOAD_CONCURRENCY):
+    """并发下载各分片, 按 idx 顺序逐块 yield 字节流, 供流式下载使用。
+
+    多个分片在线程池中并发拉取, 但输出严格按 idx 顺序, 保证客户端拿到完整文件。
+    每个分片用有界队列做背压, 避免顺序靠后的分片把内存撑爆。
+    单分片下载失败会重新取直链并从断点续传重试, 应对预签名链接过期/连接中断。
+    数据一到即下发, 浏览器立即开始下载进度。
+    """
+    ordered = sorted(chunks, key=lambda x: x["idx"])
+    if not ordered:
+        return
+    if len(ordered) == 1:
+        yield from _download_chunk_resilient(kdocs, ordered[0])
+        return
+
+    SENTINEL = object()
+    queues = [queue.Queue(maxsize=DOWNLOAD_QUEUE_SIZE) for _ in ordered]
+
+    def worker(i, c):
+        q = queues[i]
+        try:
+            for block in _download_chunk_resilient(kdocs, c):
+                q.put(block)
+        except Exception as e:
+            logger.error("DOWNLOAD worker idx=%d fileid=%s FAIL: %s", i, c["kdocs_fileid"], e)
+            q.put(("__error__", e))
+        finally:
+            q.put(SENTINEL)
+
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(ordered))) as ex:
+        for i, c in enumerate(ordered):
+            ex.submit(worker, i, c)
+        for q in queues:
+            while True:
+                item = q.get()
+                if item is SENTINEL:
+                    break
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
+                    raise item[1]
+                yield item
+
+
+def _download_chunk_resilient(kdocs: KdocsClient, chunk: dict, max_retries: int = 4):
+    """下载单个分片, 失败后从断点续传重试。
+
+    预签名直链可能过期、连接可能被限速饿死, 这里在异常时重新获取直链并从
+    已接收字节偏移处用 Range 续传, 避免整个分片从头重来。
+    """
+    fileid = int(chunk["kdocs_fileid"])
+    expected = chunk.get("size") or 0
+    offset = 0
+    for attempt in range(1, max_retries + 1):
+        try:
+            for block in kdocs.iter_download_blob(fileid, start_offset=offset):
+                offset += len(block)
+                yield block
+            # 校验: 若 DB 记录了 size 且不匹配, 视为失败重试
+            if expected and offset < expected:
+                raise IOError(f"分片不完整: 已收 {offset} / 预期 {expected}")
+            return
+        except Exception as e:
+            logger.warning("DOWNLOAD chunk idx=%s fileid=%s attempt=%d/%d offset=%d: %s",
+                           chunk.get("idx"), fileid, attempt, max_retries, offset, e)
+            if attempt >= max_retries:
+                raise
+            time.sleep(min(2 ** attempt, 8))
 
 
 def download_all(kdocs: KdocsClient, chunks: list) -> bytes:
