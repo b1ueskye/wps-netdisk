@@ -1,0 +1,267 @@
+"""业务服务层: 列目录/建夹/上传/下载/删除/重命名。
+
+每个会改动元数据的操作都在全局锁内完成, 并在成功后立即把 SQLite 回传云端,
+保证本地与云端一致、断点可恢复。
+"""
+import hashlib
+import math
+import threading
+import uuid
+
+from . import db as dbm
+from . import storage
+from .kdocs import md5_hex, sha1_hex
+from .sync import NetDiskSync
+
+
+class ServiceError(Exception):
+    pass
+
+
+class NetDiskService:
+    def __init__(self, sync: NetDiskSync):
+        self.sync = sync
+        self.kdocs = sync.kdocs
+        self.lock = threading.RLock()
+        self.sessions = {}            # upload_id -> session dict
+        self.sessions_lock = threading.Lock()
+
+    @property
+    def conn(self):
+        return self.sync.get_conn()
+
+    # ---------- 读 ----------
+    def list_dir(self, parent_id: int):
+        with self.lock:
+            nodes = dbm.list_children(self.conn, parent_id)
+            crumbs = dbm.node_path(self.conn, parent_id) if parent_id else []
+            return {"parent_id": parent_id, "breadcrumb": crumbs, "nodes": nodes,
+                    "version": self.sync.version}
+
+    def get_node(self, node_id: int):
+        with self.lock:
+            return dbm.get_node(self.conn, node_id)
+
+    # ---------- 写 ----------
+    def mkdir(self, parent_id: int, name: str):
+        name = (name or "").strip()
+        if not name:
+            raise ServiceError("文件夹名不能为空")
+        with self.lock:
+            self._ensure_parent_dir(parent_id)
+            if dbm.child_by_name(self.conn, parent_id, name):
+                raise ServiceError(f"已存在同名项: {name}")
+            # 在云端真实建出同名文件夹(镜像)
+            real_parent = self._real_parent_id(parent_id)
+            kid = int(self.kdocs.mkdir(real_parent, name)["id"])
+            node_id = dbm.create_dir(self.conn, parent_id, name, kdocs_id=kid)
+            self.sync.push_db()
+            return dbm.get_node(self.conn, node_id)
+
+    def upload_file(self, parent_id: int, name: str, fileobj):
+        name = (name or "").strip()
+        if not name:
+            raise ServiceError("文件名不能为空")
+        with self.lock:
+            self._ensure_parent_dir(parent_id)
+            existing = dbm.child_by_name(self.conn, parent_id, name)
+            if existing and existing["type"] == "dir":
+                raise ServiceError(f"已存在同名文件夹: {name}")
+
+            # 同名文件 -> 覆盖: 先删旧云端真实对象(避免重名), 再上传新的
+            if existing and existing["type"] == "file":
+                self._delete_node_cloud(existing)
+                dbm.delete_node_row(self.conn, existing["id"])
+
+            # 镜像上传到真实父目录(单片=真实文件; 大文件=同名子文件夹存分片)
+            real_parent = self._real_parent_id(parent_id)
+            chunks, total, sha256, kid = storage.mirror_upload(
+                self.kdocs, real_parent, name, fileobj, self.sync.chunk_size)
+
+            node_id = dbm.create_file(self.conn, parent_id, name, total, sha256, chunks, kdocs_id=kid)
+            self.sync.push_db()
+            return dbm.get_node(self.conn, node_id)
+
+    # ---------- 分片上传(浏览器端切片) ----------
+    def upload_init(self, parent_id: int, name: str, size: int):
+        name = (name or "").strip()
+        if not name:
+            raise ServiceError("文件名不能为空")
+        size = int(size)
+        cs = self.sync.chunk_size
+        with self.lock:
+            self._ensure_parent_dir(parent_id)
+            existing = dbm.child_by_name(self.conn, parent_id, name)
+            if existing and existing["type"] == "dir":
+                raise ServiceError(f"已存在同名文件夹: {name}")
+            # 覆盖: 先删旧的真实对象 + db 行(在创建新对象前, 避免云端重名)
+            if existing and existing["type"] == "file":
+                self._delete_node_cloud(existing)
+                dbm.delete_node_row(self.conn, existing["id"])
+            real_parent = self._real_parent_id(parent_id)
+            # 清理云端可能残留的同名孤儿对象(此前失败上传留下、但 DB 无记录),
+            # 否则 mkdir/上传会因重名 403。DB 为权威, 多余的云端对象直接删。
+            try:
+                orphan = self.kdocs.find_child(real_parent, name)
+                if orphan:
+                    self.kdocs.delete(int(orphan["id"]))
+            except Exception:
+                pass
+            multi = size > cs
+            sub_id = int(self.kdocs.mkdir(real_parent, name)["id"]) if multi else None
+
+        upload_id = uuid.uuid4().hex
+        num_chunks = max(1, math.ceil(size / cs)) if size > 0 else 1
+        sess = {
+            "parent_id": parent_id, "name": name, "size": size,
+            "real_parent": real_parent, "multi": multi, "sub_id": sub_id,
+            "num_chunks": num_chunks, "chunks": {},
+            "kdocs_id": sub_id, "lock": threading.Lock(),
+        }
+        with self.sessions_lock:
+            self.sessions[upload_id] = sess
+        return {"upload_id": upload_id, "num_chunks": num_chunks,
+                "chunk_size": cs, "multi": multi}
+
+    def upload_part(self, upload_id: str, idx: int, data: bytes):
+        with self.sessions_lock:
+            sess = self.sessions.get(upload_id)
+        if not sess:
+            raise ServiceError("上传会话不存在或已过期")
+        # 云端上传不持任何锁, 允许多片真正并发
+        if sess["multi"]:
+            part_name = f"{sess['name']}.part{idx + 1:04d}"
+            res = self.kdocs.upload_blob(sess["sub_id"], part_name, data)
+        else:
+            res = self.kdocs.upload_blob(sess["real_parent"], sess["name"], data)
+        chunk = {"idx": idx, "fileid": res["id"], "size": len(data),
+                 "md5": md5_hex(data), "sha1": sha1_hex(data)}
+        with sess["lock"]:
+            sess["chunks"][idx] = chunk
+            if not sess["multi"]:
+                sess["kdocs_id"] = res["id"]
+        return {"ok": True, "idx": idx}
+
+    def upload_complete(self, upload_id: str):
+        with self.sessions_lock:
+            sess = self.sessions.get(upload_id)
+        if not sess:
+            raise ServiceError("上传会话不存在或已过期")
+        chunks = [sess["chunks"][i] for i in sorted(sess["chunks"])]
+        if len(chunks) != sess["num_chunks"]:
+            raise ServiceError(f"分片不完整: 期望 {sess['num_chunks']} 实到 {len(chunks)}")
+        total = sum(c["size"] for c in chunks)
+        # 与到达顺序无关的整文件指纹: 按 idx 排序后组合各片 sha1
+        h = hashlib.sha256()
+        for c in chunks:
+            h.update(bytes.fromhex(c["sha1"]))
+        sha256 = h.hexdigest()
+        with self.lock:
+            node_id = dbm.create_file(self.conn, sess["parent_id"], sess["name"],
+                                      total, sha256, chunks, kdocs_id=sess["kdocs_id"])
+            self.sync.push_db()
+            node = dbm.get_node(self.conn, node_id)
+        with self.sessions_lock:
+            self.sessions.pop(upload_id, None)
+        return node
+
+    def upload_abort(self, upload_id: str):
+        with self.sessions_lock:
+            sess = self.sessions.pop(upload_id, None)
+        if not sess:
+            return False
+        # 清理已上传的云端分片/子文件夹
+        try:
+            if sess.get("sub_id"):
+                self.kdocs.delete(int(sess["sub_id"]))
+            else:
+                for c in sess["chunks"].values():
+                    self.kdocs.delete(int(c["fileid"]))
+        except Exception:
+            pass
+        return True
+
+    def rename(self, node_id: int, new_name: str):
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ServiceError("名称不能为空")
+        with self.lock:
+            node = dbm.get_node(self.conn, node_id)
+            if not node:
+                raise ServiceError("节点不存在")
+            if dbm.child_by_name(self.conn, node["parent_id"], new_name):
+                raise ServiceError(f"已存在同名项: {new_name}")
+            # 同步重命名云端真实对象(目录/单片文件/大文件子文件夹)
+            if node.get("kdocs_id"):
+                try:
+                    self.kdocs.rename(int(node["kdocs_id"]), new_name)
+                except Exception:
+                    pass
+            dbm.rename_node(self.conn, node_id, new_name)
+            self.sync.push_db()
+            return dbm.get_node(self.conn, node_id)
+
+    def delete(self, node_id: int):
+        with self.lock:
+            node = dbm.get_node(self.conn, node_id)
+            if not node:
+                raise ServiceError("节点不存在")
+            subtree = dbm.collect_subtree(self.conn, node_id)
+            # 删云端真实对象: 叶子优先(反转前序=后序), 文件夹删除会级联其内容, 这里逐个删更稳妥
+            for n in reversed(subtree):
+                self._delete_node_cloud(n)
+            # 再删 db 行
+            for n in reversed(subtree):
+                dbm.delete_node_row(self.conn, n["id"])
+            self.sync.push_db()
+            return True
+
+    # ---------- 下载 ----------
+    def open_download(self, node_id: int):
+        with self.lock:
+            node = dbm.get_node(self.conn, node_id)
+            if not node:
+                raise ServiceError("节点不存在")
+            if node["type"] != "file":
+                raise ServiceError("只能下载文件")
+            chunks = dbm.get_chunks(self.conn, node_id)
+        gen = storage.iter_download(self.kdocs, chunks)
+        return node, gen
+
+    # ---------- 内部 ----------
+    def _ensure_parent_dir(self, parent_id: int):
+        if parent_id == 0:
+            return
+        p = dbm.get_node(self.conn, parent_id)
+        if not p or p["type"] != "dir":
+            raise ServiceError("父目录不存在")
+
+    def _real_parent_id(self, parent_id: int) -> int:
+        """虚拟父目录 -> 云端真实文件夹id。根目录映射到云端 root_id。"""
+        if parent_id == 0:
+            return self.sync.root_id
+        p = dbm.get_node(self.conn, parent_id)
+        if not p or not p.get("kdocs_id"):
+            raise ServiceError("父目录在云端不存在")
+        return int(p["kdocs_id"])
+
+    def _delete_node_cloud(self, node: dict):
+        """删除一个节点对应的云端真实对象。
+
+        - 目录: 删文件夹(级联)
+        - 单片文件: 删该文件
+        - 大文件: 删同名子文件夹(级联其分片)
+        kdocs_id 已涵盖以上三种; 再兜底删分片 fileid 以防万一。
+        """
+        kid = node.get("kdocs_id")
+        if kid:
+            try:
+                self.kdocs.delete(int(kid))
+                return
+            except Exception:
+                pass
+        for c in dbm.get_chunks(self.conn, node["id"]):
+            try:
+                self.kdocs.delete(int(c["kdocs_fileid"]))
+            except Exception:
+                pass

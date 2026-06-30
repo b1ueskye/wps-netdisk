@@ -1,0 +1,21 @@
+# 敏感本地数据(含 Cookie 与本地 SQLite, 切勿提交); 仅保留示例配置
+netdisk/backend/data/*
+!netdisk/backend/data/config.example.json
+
+# 逆向调试用的探针脚本与抓包日志(含真实 Cookie)
+docs/
+downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.log

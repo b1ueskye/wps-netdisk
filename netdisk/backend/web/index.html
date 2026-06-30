@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>云文档网盘</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d2129; --line:#2a2f3a;
+    --text:#e6e9ef; --muted:#8b93a3; --accent:#4c8dff; --accent2:#2f6fe0;
+    --danger:#ff5c5c; --ok:#3ecf8e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--text);height:100vh}
+  #root{height:100vh}
+  .app{display:flex;flex-direction:column;height:100vh}
+  .topbar{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .logo{font-weight:700;font-size:18px;letter-spacing:.5px}
+  .logo .dot{color:var(--accent)}
+  .grow{flex:1}
+  .btn{border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:8px 14px;border-radius:8px;
+       cursor:pointer;font-size:13px;transition:.15s;display:inline-flex;align-items:center;gap:6px}
+  .btn:hover{border-color:var(--accent);color:#fff}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{background:var(--accent2)}
+  .btn.danger:hover{border-color:var(--danger);color:var(--danger)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .ver{font-size:12px;color:var(--muted)}
+  .crumbs{display:flex;align-items:center;gap:6px;padding:12px 20px;font-size:14px;flex-wrap:wrap}
+  .crumbs a{color:var(--accent);cursor:pointer;text-decoration:none}
+  .crumbs span.sep{color:var(--muted)}
+  .main{flex:1;overflow:auto;padding:0 20px 20px}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);font-size:14px}
+  th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+  tr.row:hover{background:var(--panel)}
+  .name{display:flex;align-items:center;gap:10px;cursor:pointer}
+  .ic{width:22px;text-align:center}
+  .row .acts{opacity:0;display:flex;gap:8px;justify-content:flex-end}
+  .row:hover .acts{opacity:1}
+  .iconbtn{cursor:pointer;color:var(--muted);font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid transparent}
+  .iconbtn:hover{color:#fff;border-color:var(--line);background:var(--panel2)}
+  .iconbtn.del:hover{color:var(--danger);border-color:var(--danger)}
+  .muted{color:var(--muted)}
+  .empty{padding:60px;text-align:center;color:var(--muted)}
+  .drop{position:fixed;inset:0;background:rgba(76,141,255,.12);border:3px dashed var(--accent);
+        display:flex;align-items:center;justify-content:center;font-size:24px;z-index:50;pointer-events:none}
+  /* modal */
+  .mask{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:100}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px;width:520px;max-width:92vw}
+  .modal h3{margin:0 0 16px}
+  .field{margin-bottom:14px}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+  .field input,.field textarea{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+       color:var(--text);padding:10px;font-size:13px;font-family:inherit}
+  .field textarea{min-height:90px;resize:vertical}
+  .row2{display:flex;gap:12px}
+  .row2 .field{flex:1}
+  .modal .actions{display:flex;justify-content:flex-end;gap:10px;margin-top:8px}
+  .err{color:var(--danger);font-size:13px;margin:8px 0}
+  .hint{color:var(--muted);font-size:12px;line-height:1.5}
+  /* upload progress */
+  .uploads{position:fixed;right:20px;bottom:20px;width:340px;display:flex;flex-direction:column;gap:8px;z-index:60}
+  .up{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .up .t{display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px}
+  .bar{height:6px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .bar > i{display:block;height:100%;background:var(--accent);transition:width .2s}
+  .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2);color:var(--muted)}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);
+        border-radius:50%;animation:s 1s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useRef} = React;
+
+const api = {
+  async status(){ return (await fetch('/api/status')).json(); },
+  async setConfig(b){ const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+    if(!r.ok) throw new Error((await r.json()).detail||'失败'); return r.json(); },
+  async reload(){ const r=await fetch('/api/reload',{method:'POST'}); if(!r.ok) throw new Error((await r.json()).detail); return r.json(); },
+  async list(pid){ const r=await fetch('/api/files?parent_id='+pid); if(!r.ok) throw new Error((await r.json()).detail); return r.json(); },
+  async mkdir(pid,name){ const r=await fetch('/api/folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent_id:pid,name})});
+    if(!r.ok) throw new Error((await r.json()).detail); return r.json(); },
+  async rename(id,name){ const r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({node_id:id,name})});
+    if(!r.ok) throw new Error((await r.json()).detail); return r.json(); },
+  async del(id){ const r=await fetch('/api/node/'+id,{method:'DELETE'}); if(!r.ok) throw new Error((await r.json()).detail); return r.json(); },
+};
+
+function fmtSize(n){ if(n==null) return '-'; const u=['B','KB','MB','GB','TB']; let i=0,x=n; while(x>=1024&&i<u.length-1){x/=1024;i++;} return (i?x.toFixed(2):x)+' '+u[i]; }
+function fmtTime(t){ if(!t) return '-'; const d=new Date(t*1000); return d.toLocaleString('zh-CN',{hour12:false}); }
+
+function Modal({title,children,onClose}){
+  return <div className="mask" onClick={onClose}>
+    <div className="modal" onClick={e=>e.stopPropagation()}>
+      <h3>{title}</h3>{children}
+    </div></div>;
+}
+
+function ConfigModal({status,onClose,onSaved}){
+  const [cookie,setCookie]=useState('');
+  const [groupId,setGroupId]=useState(status.group_id||'');
+  const [rootName,setRootName]=useState(status.root_name||'WpsNetDisk');
+  const [chunk,setChunk]=useState(status.chunk_size_mb||512);
+  const [err,setErr]=useState(''); const [busy,setBusy]=useState(false);
+  const save=async()=>{ setBusy(true); setErr('');
+    try{ const body={group_id:groupId,root_name:rootName,chunk_size_mb:chunk};
+      if(cookie.trim()) body.cookie=cookie.trim();
+      await api.setConfig(body); onSaved(); }
+    catch(e){ setErr(String(e.message||e)); } finally{ setBusy(false);} };
+  return <Modal title="云文档配置" onClose={onClose}>
+    <div className="field"><label>云文档 Cookie {status.has_cookie?'(已保存, 留空则不修改)':'(必填)'}</label>
+      <textarea placeholder="粘贴浏览器里 drive.kdocs.cn 请求的完整 Cookie (含 wps_sid / kso_sid / csrf)"
+        value={cookie} onChange={e=>setCookie(e.target.value)}/></div>
+    <div className="row2">
+      <div className="field"><label>group_id (必填)</label>
+        <input value={groupId} onChange={e=>setGroupId(e.target.value)} placeholder="如 1613403198"/></div>
+      <div className="field"><label>分片大小 (MB)</label>
+        <input type="number" value={chunk} onChange={e=>setChunk(e.target.value)}/></div>
+    </div>
+    <div className="field"><label>云端根目录名 (跨设备据此发现)</label>
+      <input value={rootName} onChange={e=>setRootName(e.target.value)}/></div>
+    <p className="hint">数据与元数据库(SQLite)都会存到你云文档的「{rootName}」目录里。换电脑时只要填同一个 Cookie 与 group_id 即可恢复全部数据。</p>
+    {err && <div className="err">{err}</div>}
+    <div className="actions">
+      <button className="btn" onClick={onClose}>取消</button>
+      <button className="btn primary" disabled={busy} onClick={save}>{busy?<span className="spin"/>:'保存并连接'}</button>
+    </div>
+  </Modal>;
+}
+
+function App(){
+  const [status,setStatus]=useState(null);
+  const [showCfg,setShowCfg]=useState(false);
+  const [data,setData]=useState(null);
+  const [pid,setPid]=useState(0);
+  const [err,setErr]=useState('');
+  const [dragging,setDragging]=useState(false);
+  const [uploads,setUploads]=useState([]);
+  const fileInput=useRef();
+
+  const refreshStatus=useCallback(async()=>{ const s=await api.status(); setStatus(s); return s; },[]);
+  const load=useCallback(async(p)=>{ setErr('');
+    try{ const d=await api.list(p); setData(d); setPid(p); }
+    catch(e){ setErr(String(e.message||e)); } },[]);
+
+  useEffect(()=>{ (async()=>{ const s=await refreshStatus();
+    if(!s.configured || !s.initialized){ setShowCfg(true); } else { load(0); } })(); },[]);
+
+  const onSaved=async()=>{ setShowCfg(false); const s=await refreshStatus(); if(s.initialized) load(0); };
+
+  const doMkdir=async()=>{ const name=prompt('新建文件夹名称'); if(!name) return;
+    try{ await api.mkdir(pid,name); load(pid); }catch(e){ alert(e.message||e);} };
+  const doRename=async(n)=>{ const name=prompt('重命名为', n.name); if(!name||name===n.name) return;
+    try{ await api.rename(n.id,name); load(pid); }catch(e){ alert(e.message||e);} };
+  const doDelete=async(n)=>{ if(!confirm(`确定删除「${n.name}」${n.type==='dir'?'及其全部内容':''}? 云端数据会一并删除`)) return;
+    try{ await api.del(n.id); load(pid); }catch(e){ alert(e.message||e);} };
+  const doDownload=(n)=>{ window.location.href='/api/download/'+n.id; };
+
+  // 把一个分片(blob)发到后端, 返回 Promise, 带上传进度回调
+  const sendPart=(uid,idx,blob,onprog)=>new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST',`/api/upload/part?upload_id=${uid}&idx=${idx}`);
+    xhr.upload.onprogress=e=>{ if(e.lengthComputable) onprog(e.loaded); };
+    xhr.onload=()=>{ if(xhr.status>=200&&xhr.status<300) resolve();
+      else { try{reject(new Error(JSON.parse(xhr.responseText).detail))}catch(_){reject(new Error('分片上传失败'))} } };
+    xhr.onerror=()=>reject(new Error('网络错误'));
+    xhr.send(blob);
+  });
+
+  const uploadOne=useCallback(async(file,uiId)=>{
+    const upd=(p)=>setUploads(u=>u.map(x=>x.id===uiId?{...x,...p}:x));
+    try{
+      const r=await fetch('/api/upload/init',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({parent_id:pid,name:file.name,size:file.size})});
+      if(!r.ok) throw new Error((await r.json()).detail||'init 失败');
+      const {upload_id,num_chunks,chunk_size}=await r.json();
+      const total=file.size||1;
+      const CONC=Math.min(3,num_chunks);     // 并发连接数, 3 即可吃满上行带宽
+      const loaded=new Array(num_chunks).fill(0);
+      let done=0;
+      const refresh=()=>{
+        const sum=loaded.reduce((a,b)=>a+b,0);
+        upd({pct:Math.min(99,Math.round(sum/total*100)), state:'uploading',
+             msg:num_chunks>1?`${done}/${num_chunks}片 · ${CONC}并发`:''});
+      };
+      let next=0;
+      const worker=async()=>{
+        while(true){
+          const idx=next++; if(idx>=num_chunks) break;
+          const start=idx*chunk_size, end=Math.min(start+chunk_size,file.size);
+          await sendPart(upload_id,idx,file.slice(start,end),(b)=>{ loaded[idx]=b; refresh(); });
+          loaded[idx]=end-start; done++; refresh();
+        }
+      };
+      await Promise.all(Array.from({length:CONC},worker));
+      const cr=await fetch(`/api/upload/complete?upload_id=${upload_id}`,{method:'POST'});
+      if(!cr.ok) throw new Error((await cr.json()).detail||'完成失败');
+      upd({pct:100,state:'done',msg:''});
+      load(pid);
+      setTimeout(()=>setUploads(u=>u.filter(x=>x.id!==uiId)),2500);
+    }catch(e){
+      upd({state:'error',msg:String(e.message||e)});
+      setTimeout(()=>setUploads(u=>u.filter(x=>x.id!==uiId)),6000);
+    }
+  },[pid,load]);
+
+  const uploadFiles=useCallback((files)=>{
+    [...files].forEach(file=>{
+      const uiId=Math.random().toString(36).slice(2);
+      setUploads(u=>[...u,{id:uiId,name:file.name,pct:0,state:'uploading'}]);
+      uploadOne(file,uiId);
+    });
+  },[uploadOne]);
+
+  // drag & drop
+  useEffect(()=>{
+    const over=e=>{e.preventDefault(); setDragging(true);};
+    const leave=e=>{e.preventDefault(); if(e.relatedTarget===null) setDragging(false);};
+    const drop=e=>{e.preventDefault(); setDragging(false);
+      if(status&&status.initialized&&e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);};
+    window.addEventListener('dragover',over); window.addEventListener('dragleave',leave); window.addEventListener('drop',drop);
+    return()=>{window.removeEventListener('dragover',over);window.removeEventListener('dragleave',leave);window.removeEventListener('drop',drop);};
+  },[status,uploadFiles]);
+
+  if(!status) return <div className="empty"><span className="spin"/> 加载中...</div>;
+
+  const ready = status.initialized;
+  const nodes = data ? data.nodes : [];
+  const crumbs = data ? data.breadcrumb : [];
+
+  return <div className="app">
+    {dragging && ready && <div className="drop">松手上传到当前目录</div>}
+    <div className="topbar">
+      <div className="logo">云文档<span className="dot">·</span>网盘</div>
+      {ready && <span className="ver">v{status.version} · group {status.group_id}</span>}
+      <div className="grow"/>
+      {ready && <>
+        <button className="btn" onClick={()=>api.reload().then(()=>load(pid)).catch(e=>alert(e.message||e))} title="从云端重新拉取(换设备/多端时)">↻ 同步</button>
+        <button className="btn" onClick={doMkdir}>＋ 新建文件夹</button>
+        <button className="btn primary" onClick={()=>fileInput.current.click()}>⬆ 上传文件</button>
+        <input ref={fileInput} type="file" multiple style={{display:'none'}}
+          onChange={e=>{ if(e.target.files.length) uploadFiles(e.target.files); e.target.value=''; }}/>
+      </>}
+      <button className="btn" onClick={()=>setShowCfg(true)}>⚙ 设置</button>
+    </div>
+
+    {!ready && <div className="empty">
+      {status.error ? <div className="err">连接失败: {status.error}</div> : '请先在「设置」中填入云文档 Cookie 与 group_id'}
+      <div style={{marginTop:16}}><button className="btn primary" onClick={()=>setShowCfg(true)}>去配置</button></div>
+    </div>}
+
+    {ready && <>
+      <div className="crumbs">
+        <a onClick={()=>load(0)}>🏠 根目录</a>
+        {crumbs.map(c=><React.Fragment key={c.id}><span className="sep">/</span><a onClick={()=>load(c.id)}>{c.name}</a></React.Fragment>)}
+      </div>
+      <div className="main">
+        {err && <div className="err">{err}</div>}
+        {nodes.length===0 ? <div className="empty">这个文件夹是空的 —— 拖拽文件到此处即可上传</div> :
+        <table><thead><tr><th>名称</th><th style={{width:130}}>大小</th><th style={{width:180}}>修改时间</th><th style={{width:160}}></th></tr></thead>
+        <tbody>{nodes.map(n=>
+          <tr className="row" key={n.id}>
+            <td><div className="name" onClick={()=>n.type==='dir'?load(n.id):doDownload(n)}>
+              <span className="ic">{n.type==='dir'?'📁':'📄'}</span><span>{n.name}</span></div></td>
+            <td className="muted">{n.type==='dir'?'-':fmtSize(n.size)}</td>
+            <td className="muted">{fmtTime(n.mtime)}</td>
+            <td><div className="acts">
+              {n.type==='file' && <span className="iconbtn" onClick={()=>doDownload(n)}>下载</span>}
+              <span className="iconbtn" onClick={()=>doRename(n)}>重命名</span>
+              <span className="iconbtn del" onClick={()=>doDelete(n)}>删除</span>
+            </div></td>
+          </tr>)}
+        </tbody></table>}
+      </div>
+    </>}
+
+    {uploads.length>0 && <div className="uploads">{uploads.map(u=>
+      <div className="up" key={u.id}>
+        <div className="t"><span>{u.name}</span>
+          <span className="badge">{u.state==='done'?'✓ 完成':u.state==='error'?'✗ '+(u.msg||'失败'):u.pct+'%'}</span></div>
+        <div className="bar"><i style={{width:u.pct+'%',background:u.state==='error'?'var(--danger)':u.state==='done'?'var(--ok)':'var(--accent)'}}/></div>
+      </div>)}</div>}
+
+    {showCfg && <ConfigModal status={status} onClose={()=>setShowCfg(false)} onSaved={onSaved}/>}
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
